@@ -1,7 +1,7 @@
 {
   "id": "aiden-memory-sync",
   "name": "AIDEN Memory Sync",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "minAppVersion": "1.4.0",
   "description": "Synchronize the dedicated AIDEN Memory vault folder with an AIDEN node.",
   "author": "AIDEN",
