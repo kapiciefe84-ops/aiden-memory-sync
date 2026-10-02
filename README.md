@@ -1,6 +1,6 @@
 # AIDEN Memory Sync for Obsidian
 
-This is a standalone, dependency-free Obsidian community plugin. It synchronizes Markdown notes in the dedicated `AIDEN Memory/` vault folder with an AIDEN server. AIDEN's server-side PostgreSQL records are the source of truth, so memory remains available across devices even when Obsidian is offline.
+This is a standalone, dependency-free Obsidian community plugin. It synchronizes individual Markdown memory notes directly in the Obsidian vault root with an AIDEN server. AIDEN's server-side PostgreSQL records are the source of truth, so memory remains available across devices even when Obsidian is offline.
 
 ## Manual installation
 
@@ -19,22 +19,10 @@ If the plugin reports **“Unrecognized token”**, check the **Replit external 
 
 On some devices, **“JSON Parse error: Unrecognized token”** means the server returned HTML (such as a sign-in page) rather than the sync API's JSON. Check the server origin and private Replit access settings. The plugin rejects these responses before processing notes. Obsidian account 2FA is separate from both sync credentials.
 
-The plugin only writes below `AIDEN Memory/`. `Index.md` is generated from the server file list and linked memories; `Conflicts/` contains preserved remote copies when both local and remote versions changed. Existing local notes are preserved during first sync rather than silently overwritten. New Markdown notes can be uploaded; `Index.md` and `Conflicts/` are never uploaded. Private finance records are excluded from sync and backup exports.
+Individual synced memories are named `AIDEN-<id>.md` and stored directly in the vault root. The generated `AIDEN Memory/Index.md` is only an overview with links to those root-level notes; it does not contain the memories. Conflict copies are also preserved as separate root-level notes, and existing vault files are never overwritten. Files in the legacy `AIDEN Memory/` folder are moved to the root on sync when safe. To create a new local memory, use **Create AIDEN memory draft in vault root** from the command palette, or create a Markdown file named `AIDEN-Draft-*.md`; drafts are uploaded once and renamed to their AIDEN ID. The index, conflicts, and unrelated root notes are never uploaded. Private finance records are excluded from sync and backup exports.
 
 Local deletion is never automatically sent to the server. To explicitly delete the active synced note, use **Delete active AIDEN Memory note (confirmation)**; it asks for confirmation and then sends the revision-checked DELETE. If a memory was deleted on the server, the local note is kept and is not re-uploaded automatically. Requests use bearer authorization and a bounded timeout; retryable reads and updates make at most three attempts, while creates are attempted once to avoid duplicate records after a timeout. For private Replit URLs, the Replit token is sent as the bearer credential and the AIDEN token is sent separately in `X-AIDEN-Sync-Token`. Tokens and note contents are not logged.
 
 ## Smoke check
 
-In a test vault, configure an AIDEN origin and token, create `AIDEN Memory/Example.md`, and run the command. Confirm that the server receives a POST and that a later remote edit pulls into the note. Edit both copies, sync again, and confirm a file appears under `AIDEN Memory/Conflicts/`. Remove a local note and sync; it must not issue a DELETE request.
-
-## Building from source
-
-Requires Node.js 22.12 or later and the `zip` command. Runtime plugin installation does not require Node.js.
-
-```sh
-npm install
-npm run build
-npm test
-```
-
-Source lives under `src/obsidian-plugin/`. The build generates the installable CommonJS `main.js`, the matching root manifest, and versioned release files under `public/obsidian-plugin/`. Obsidian remains external to the bundle. Tests load the actual bundle in an isolated CommonJS context and check authorization and response handling.
+In a test vault, configure an AIDEN origin and token, create `AIDEN-Draft-Example.md` in the vault root, and run the command. Confirm that the server receives a POST and the note is renamed to `AIDEN-<id>.md` with canonical metadata. Edit both copies, sync again, and confirm a separate conflict copy appears in the vault root. Remove a local note and sync; it must not issue a DELETE request.
