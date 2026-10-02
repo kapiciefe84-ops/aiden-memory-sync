@@ -219,6 +219,50 @@ export default class AidenMemorySync extends Plugin {
     new Notice(`AIDEN conflict preserved in ${path}`);
   }
 
+  async preserveLocalCopy(path, content, reason) {
+    if (!validPath(path)) throw new Error("AIDEN cannot preserve a local copy at an unsafe path.");
+    const leaf = path.split("/").pop().replace(/\.md$/i, "");
+    const safe = leaf.replace(/[^a-zA-Z0-9 _-]/g, "_").slice(0, 80) || "note";
+    const stamp = Date.now();
+    let suffix = 0;
+    let conflictPath;
+    do {
+      conflictPath = `${FOLDER}/Conflicts/${safe} (local-copy-${stamp}${suffix ? `-${suffix}` : ""}).md`;
+      suffix += 1;
+    } while (this.app.vault.getAbstractFileByPath(conflictPath));
+    const text = `# Local copy of ${path}\n\n> Preserved by AIDEN Memory Sync: ${reason}\n\n${content}`;
+    await this.writeLocal(conflictPath, text);
+    return conflictPath;
+  }
+
+  async recoverIdMismatch(remote, local) {
+    const response = await this.request("GET", "/api/memory-sync/files");
+    const files = Array.isArray(response.json?.files) ? response.json.files : [];
+    const current = files.find((file) => file.id === remote.id && validPath(file.path));
+    if (!current || typeof current.content !== "string") {
+      throw new Error(`AIDEN could not safely restore memory ${remote.id}; the server copy is no longer available.`);
+    }
+
+    const currentLocalContent = await this.app.vault.read(local);
+    const conflictPath = await this.preserveLocalCopy(
+      local.path,
+      currentLocalContent,
+      `The server rejected this file because its metadata ID did not match memory ${remote.id}.`
+    );
+    const occupied = this.app.vault.getAbstractFileByPath(current.path);
+    if (occupied && occupied !== local) {
+      throw new Error(`AIDEN preserved the local copy at ${conflictPath}, but cannot restore ${current.path} because another note already occupies that path.`);
+    }
+
+    const target = local.path === current.path ? local : await this.moveLocal(local, current.path);
+    if (target.path !== current.path) {
+      throw new Error(`AIDEN preserved the local copy at ${conflictPath}, but could not move the canonical note to ${current.path}.`);
+    }
+    await this.app.vault.modify(target, current.content);
+    new Notice(`AIDEN restored ${current.path} from the server. The previous local copy is saved at ${conflictPath}.`);
+    return current;
+  }
+
   async deleteRemote(entry, localFile) {
     const question = entry.remoteDeleted
       ? `Delete the remaining local copy of "${entry.path}"? AIDEN has already deleted the server copy.`
@@ -296,6 +340,19 @@ export default class AidenMemorySync extends Plugin {
             const savedHash = await hash(saved.content);
             next[String(saved.id)] = { path: saved.path, id: saved.id, hash: savedHash, remoteHash: savedHash, revision: saved.revision };
           } catch (error) {
+            if (error.status === 400 && error.payload?.error === "memory_id_mismatch") {
+              const current = await this.recoverIdMismatch(item, local);
+              const restoredHash = await hash(current.content);
+              next[String(current.id)] = {
+                path: current.path,
+                id: current.id,
+                hash: restoredHash,
+                remoteHash: restoredHash,
+                revision: current.revision
+              };
+              conflicts++;
+              continue;
+            }
             if (error.status !== 409) throw error;
             await this.conflict(error.payload.current, localContent);
             conflicts++;
@@ -330,10 +387,24 @@ export default class AidenMemorySync extends Plugin {
         }
         const result = await this.request("POST", "/api/memory-sync/files", { content });
         const saved = result.json.file;
-        if (saved && validPath(saved.path)) {
-          await this.moveLocal(file, saved.path);
+        if (saved && validPath(saved.path) && typeof saved.content === "string" && Number.isFinite(saved.id) && Number.isFinite(saved.revision)) {
+          const moved = await this.moveLocal(file, saved.path);
+          if (moved.path !== saved.path) {
+            throw new Error(`AIDEN created memory ${saved.id}, but ${saved.path} is already occupied locally. No existing note was overwritten.`);
+          }
+          const currentLocalContent = await this.app.vault.read(moved);
+          if (currentLocalContent !== content) {
+            await this.preserveLocalCopy(
+              saved.path,
+              currentLocalContent,
+              "The local note changed while its first sync was being saved."
+            );
+          }
+          await this.app.vault.modify(moved, saved.content);
           const savedHash = await hash(saved.content);
           next[String(saved.id)] = { path: saved.path, id: saved.id, hash: savedHash, remoteHash: savedHash, revision: saved.revision };
+        } else {
+          throw new Error("AIDEN returned an invalid response after creating a memory.");
         }
       }
 
