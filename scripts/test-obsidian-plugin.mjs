@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
@@ -18,7 +19,7 @@ function harness(response, externalToken = "") {
     Notice: class {},
     requestUrl: async (options) => {
       requests.push(options);
-      return response;
+      return typeof response === "function" ? response(options) : response;
     }
   };
   vm.runInNewContext(bundle, {
@@ -30,6 +31,7 @@ function harness(response, externalToken = "") {
     },
     URL,
     TextEncoder,
+    window: { crypto: webcrypto },
     setTimeout,
     clearTimeout
   }, { filename: "obsidian-main.cjs" });
@@ -41,6 +43,49 @@ function harness(response, externalToken = "") {
     replitAccessToken: externalToken
   };
   return { plugin, requests };
+}
+
+function response(status, payload) {
+  return { status, text: JSON.stringify(payload) };
+}
+
+function makeVault(entries = []) {
+  const files = new Map();
+  const folders = new Set();
+  for (const { path: filePath, content } of entries) {
+    files.set(filePath, { path: filePath, extension: "md", content });
+  }
+  return {
+    files,
+    getMarkdownFiles: () => [...files.values()],
+    getAbstractFileByPath: (filePath) => files.get(filePath) || (folders.has(filePath) ? { path: filePath } : null),
+    read: async (file) => files.get(file.path)?.content,
+    modify: async (file, content) => {
+      const stored = files.get(file.path);
+      assert.ok(stored, `Expected existing file at ${file.path}`);
+      stored.content = content;
+    },
+    create: async (filePath, content) => {
+      assert.ok(!files.has(filePath), `Unexpected duplicate file at ${filePath}`);
+      const file = { path: filePath, extension: "md", content };
+      files.set(filePath, file);
+      return file;
+    },
+    createFolder: async (folderPath) => { folders.add(folderPath); },
+    rename: async (file, targetPath) => {
+      const stored = files.get(file.path);
+      assert.ok(stored, `Expected existing file at ${file.path}`);
+      assert.ok(!files.has(targetPath), `Unexpected occupied path ${targetPath}`);
+      files.delete(file.path);
+      stored.path = targetPath;
+      files.set(targetPath, stored);
+    }
+  };
+}
+
+async function sha256(value) {
+  const digest = await webcrypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 test("plain-text token rejection gives guidance without attempting JSON getter", async () => {
@@ -119,4 +164,87 @@ test("revision conflict status and payload are preserved without retry", async (
     return true;
   });
   assert.equal(requests.length, 1);
+});
+
+test("a new local note is replaced with the server's canonical metadata after upload", async () => {
+  const original = "# AIDEN Memory\n\nA newly imported note";
+  const canonical = "---\nid: 1208\ncategory: \"knowledge\"\nscope: \"global\"\npriority: 3\nsource: \"imported\"\nexpiresAt: null\narchivedAt: null\nrevision: 1\nrelatedMemoryIds: []\n---\n# AIDEN Memory\n\nA newly imported note";
+  const serverFile = {
+    id: 1208,
+    path: "AIDEN Memory/knowledge/1208.md",
+    content: canonical,
+    revision: 1
+  };
+  let created = false;
+  const { plugin, requests } = harness(async (options) => {
+    const pathname = new URL(options.url).pathname;
+    if (options.method === "GET" && pathname === "/api/memory-sync/files") {
+      return response(200, { files: created ? [serverFile] : [] });
+    }
+    if (options.method === "POST" && pathname === "/api/memory-sync/files") {
+      assert.equal(JSON.parse(options.body).content, original);
+      created = true;
+      return response(201, { file: serverFile });
+    }
+    assert.fail(`Unexpected ${options.method} ${pathname}`);
+  });
+  const vault = makeVault([{ path: "AIDEN Memory/knowledge/import.md", content: original }]);
+  plugin.app = { vault };
+  plugin.state = { files: {} };
+  plugin.saveSettings = async () => {};
+  plugin.updateIndex = async () => {};
+
+  await plugin.sync({ silent: true });
+  assert.equal(vault.files.get(serverFile.path)?.content, canonical);
+  assert.equal(plugin.state.files["1208"].hash, await sha256(canonical));
+
+  await plugin.sync({ silent: true });
+  assert.equal(requests.filter((request) => request.method === "POST").length, 1);
+  assert.equal(requests.filter((request) => request.method === "PUT").length, 0);
+});
+
+test("an ID mismatch preserves the local note and restores the current server copy", async () => {
+  const localContent = "# AIDEN Memory\n\nA locally preserved copy";
+  const canonical = "---\nid: 1208\ncategory: \"knowledge\"\nscope: \"global\"\npriority: 3\nsource: \"imported\"\nexpiresAt: null\narchivedAt: null\nrevision: 1\nrelatedMemoryIds: []\n---\n# AIDEN Memory\n\nA locally preserved copy";
+  const serverFile = {
+    id: 1208,
+    path: "AIDEN Memory/knowledge/1208.md",
+    content: canonical,
+    revision: 1
+  };
+  const { plugin, requests } = harness(async (options) => {
+    const pathname = new URL(options.url).pathname;
+    if (options.method === "GET" && pathname === "/api/memory-sync/files") {
+      return response(200, { files: [serverFile] });
+    }
+    if (options.method === "PUT" && pathname === "/api/memory-sync/files/1208") {
+      return response(400, { error: "memory_id_mismatch" });
+    }
+    assert.fail(`Unexpected ${options.method} ${pathname}`);
+  });
+  const vault = makeVault([{ path: serverFile.path, content: localContent }]);
+  const canonicalHash = await sha256(canonical);
+  plugin.app = { vault };
+  plugin.state = {
+    files: {
+      "1208": {
+        path: serverFile.path,
+        id: 1208,
+        hash: canonicalHash,
+        remoteHash: canonicalHash,
+        revision: 1
+      }
+    }
+  };
+  plugin.saveSettings = async () => {};
+  plugin.updateIndex = async () => {};
+
+  await plugin.sync({ silent: true });
+
+  assert.equal(vault.files.get(serverFile.path)?.content, canonical);
+  const localBackup = [...vault.files.values()].find((file) => file.path.startsWith("AIDEN Memory/Conflicts/"));
+  assert.ok(localBackup);
+  assert.ok(localBackup.content.includes(localContent));
+  assert.equal(plugin.state.files["1208"].hash, canonicalHash);
+  assert.equal(requests.filter((request) => request.method === "PUT").length, 1);
 });
